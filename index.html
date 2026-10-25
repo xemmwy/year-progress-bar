@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Year Progress</title>
+<!-- Design: "Pink Static" -->
+<style>
+  @font-face {
+    font-family: "Geist Pixel Square";
+    src: url("https://cdn.jsdelivr.net/npm/geist@1.8.2/dist/fonts/geist-pixel/GeistPixel-Square.woff2") format("woff2");
+    font-display: swap;
+  }
+  :root {
+    --bg: #fffafb;
+    --text: #4a2f37;
+    --text-muted: #8a6973;
+    --track: #fbe9ee;
+    --fill: #f6b3c6;   /* pastel pink */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1518;
+      --text: #fbe4ea;
+      --text-muted: #a88e96;
+      --track: #2e2226;
+      --fill: #f6b3c6;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Geist Pixel Square", ui-monospace, monospace;
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
+    display: grid;
+    place-items: center;
+    padding: 16px;
+  }
+  .card { width: min(560px, 100%); min-width: 0; }
+  .label {
+    font-size: 12px;
+    line-height: 1.4;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 12px;
+  }
+  .pct { font-size: 32px; line-height: 1; }
+  .bar-wrap { position: relative; }
+  .bar {
+    position: relative;
+    height: 28px;
+    background: var(--track);
+    overflow: hidden;
+  }
+  /* Out of flow, so its whole-cell width never holds the layout open. */
+  canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    display: block;
+    height: 100%;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+  /* Invisible button covering the bar: click, Enter or Space reloads. */
+  .hit {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+  }
+  .hit:focus-visible { outline: 2px solid var(--text); outline-offset: 4px; }
+  .foot {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 8px;
+  }
+  .hint { margin-top: 24px; text-align: center; text-wrap: balance; }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <h1 class="sr-only">Year progress</h1>
+    <div class="row">
+      <span class="label" id="year">----</span>
+      <span class="pct" id="pct" aria-hidden="true">--.-%</span>
+    </div>
+    <div class="bar-wrap">
+      <div class="bar" id="bar" role="progressbar" aria-label="Year progress"
+           aria-valuemin="0" aria-valuemax="100">
+        <canvas id="cv" aria-hidden="true"></canvas>
+      </div>
+      <button class="hit" id="hit" type="button" aria-label="Replay the fill animation"></button>
+    </div>
+    <div class="foot">
+      <span class="label" id="day">Day --</span>
+      <span class="label" id="left">-- days left</span>
+    </div>
+    <p class="label hint">Click or press R to reload · P to pause</p>
+  </main>
+
+<script>
+(() => {
+  // Design tokens
+  const PIXEL   = 4;     // dither cell, CSS px
+  const BAND    = 0.22;  // dissolve zone, share of bar width
+  const SOFT    = 0.18;  // fade softness of each pixel (0 = hard blink)
+  const RATE    = 0.22;  // blink cycles per second at full motion
+  const FLOW    = 0.045; // phase offset per column: blinks ripple left → right
+  const STILL   = 0.7;   // motion reaches zero at this point across the band
+  const FILL_MS = 1600;  // fill animation on load / reload
+
+  // 8x8 Bayer matrix, normalised to 0..1
+  const B = [
+     0,32, 8,40, 2,34,10,42,
+    48,16,56,24,50,18,58,26,
+    12,44, 4,36,14,46, 6,38,
+    60,28,52,20,62,30,54,22,
+     3,35,11,43, 1,33, 9,41,
+    51,19,59,27,49,17,57,25,
+    15,47, 7,39,13,45, 5,37,
+    63,31,55,23,61,29,53,21
+  ].map(v => (v + 0.5) / 64);
+
+  const $ = id => document.getElementById(id);
+  const cv = $('cv'), ctx = cv.getContext('2d'), bar = $('bar');
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+
+  let cols = 0, rows = 0, img = null, base = null, acc = null;
+  let rgb = [246, 179, 198];
+  let target = 0, fillStart = 0, lastT = 0, paused = false;
+
+  function yearProgress(now = new Date()) {
+    const y = now.getFullYear();
+    const start = new Date(y, 0, 1), end = new Date(y + 1, 0, 1);
+    const totalDays = Math.round((end - start) / 864e5);
+    const day = Math.floor((now - start) / 864e5) + 1;
+    return { y, p: (now - start) / (end - start), day, left: totalDays - day };
+  }
+
+  function readColor() {
+    const hex = getComputedStyle(document.documentElement).getPropertyValue('--fill').trim();
+    const m = hex.match(/^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i);
+    if (m) rgb = [1, 2, 3].map(i => parseInt(m[i], 16));
+  }
+
+  // Whole cells only, so every pixel is exactly PIXEL×PIXEL.
+  function resize() {
+    cols = Math.ceil(bar.clientWidth / PIXEL);
+    rows = Math.ceil(bar.clientHeight / PIXEL);
+    cv.width = cols; cv.height = rows;
+    cv.style.width = cols * PIXEL + 'px';
+    img = ctx.createImageData(cols, rows);
+    base = new Float32Array(cols * rows); // fixed phase: Bayer + a little hash + flow offset
+    acc  = new Float32Array(cols * rows); // phase each pixel has travelled so far
+    for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+      const h = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+      base[y * cols + x] = B[(y & 7) * 8 + (x & 7)] + 0.35 * (h - Math.floor(h)) - x * FLOW;
+    }
+  }
+
+  const easeOut = t => 1 - Math.pow(1 - t, 3);
+
+  // p: progress 0..1 · dt: seconds of motion to advance this frame (0 = still)
+  function draw(p, dt) {
+    const data = img.data;
+    data.fill(0);
+    const edge = p * cols;
+    const band = Math.max(BAND * cols * Math.min(1, p * 4), 1); // narrower near 0%
+    const bandStart = edge - band / 2;
+    const bandEnd = Math.min(cols, Math.ceil(edge + band / 2));
+    const [r, g, b] = rgb;
+
+    for (let x = 0; x < bandEnd; x++) {
+      const s = (x + 0.5 - bandStart) / band; // 0 = left of band, 1 = right
+      const d = 1 - s;                        // density: 1 → 0 across the band
+      if (d <= 0) break;
+      const solid = d >= 1;
+      const dd = d * (1 + SOFT) - SOFT / 2;
+      let w = 1 - s / STILL;                  // motion strength, tapering to still
+      w = w > 0 ? w * w : 0;
+      const step = w * dt * RATE;
+      for (let y = 0; y < rows; y++) {
+        const k = y * cols + x;
+        let a = 1;
+        if (!solid) {
+          acc[k] += step;
+          // Threshold sweeps 0→1→0 (triangle wave): average density stays d, so the band
+          // never moves while its pixels fade in and out.
+          let u = base[k] + acc[k];
+          u -= Math.floor(u);
+          const thr = 1 - Math.abs(2 * u - 1);
+          a = (dd - thr) / SOFT + 0.5;
+          if (a <= 0) continue;
+          if (a > 1) a = 1;
+        }
+        const i = k * 4;
+        data[i] = r; data[i + 1] = g; data[i + 2] = b; data[i + 3] = a * 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  function updateText() {
+    const { y, p, day, left } = yearProgress();
+    target = p;
+    const pct = (p * 100).toFixed(1);
+    $('year').textContent = y;
+    $('day').textContent = 'Day ' + day;
+    $('left').textContent = left + (left === 1 ? ' day left' : ' days left');
+    bar.setAttribute('aria-valuenow', pct);
+    bar.setAttribute('aria-valuetext', `${pct}% of ${y}, day ${day}, ${left} days left`);
+  }
+
+  function reload() { fillStart = performance.now(); }
+  function togglePause() { paused = !paused; }
+
+  function frame(now) {
+    const still = reduceMotion.matches;
+    const k = still ? 1 : Math.min(1, (now - fillStart) / FILL_MS);
+    const shown = target * easeOut(k);
+    $('pct').textContent = (shown * 100).toFixed(1) + '%';
+    const dt = still || paused ? 0 : Math.min(0.1, (now - lastT) / 1000); // cap after hidden tabs
+    lastT = now;
+    draw(shown, dt);
+    requestAnimationFrame(frame);
+  }
+
+  readColor();
+  resize();
+  updateText();
+  reload();
+  lastT = performance.now();
+  requestAnimationFrame(frame);
+
+  new ResizeObserver(resize).observe(bar);
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', readColor);
+  setInterval(updateText, 60_000);
+  $('hit').addEventListener('click', reload);
+  addEventListener('keydown', e => {
+    if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+    const key = e.key.toLowerCase();
+    if (key === 'r') reload();
+    else if (key === 'p') togglePause();
+  });
+})();
+</script>
+</body>
+</html>
